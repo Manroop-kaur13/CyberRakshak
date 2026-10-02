@@ -1,0 +1,41 @@
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Local databases and backups
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.bak
+
+# Python generated files and environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+ENV/
+
+# Build, test, and deployment output
+node_modules/
+dist/
+build/
+coverage/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.vercel/
+.render/
+*.log
+
+# OS/editor artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
