@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: cyberrakshak-api
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt && python -m py_compile server.py
+    startCommand: python server.py
+    healthCheckPath: /api/ready
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: DATABASE_URL
+        sync: false
+      - key: ALLOWED_ORIGIN
+        sync: false

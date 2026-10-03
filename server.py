@@ -4,18 +4,43 @@ from pathlib import Path
 import json, sqlite3, os, threading
 
 ROOT = Path(__file__).parent
-DB = ROOT / 'cyberrakshak.sqlite3'
+DATABASE_URL = os.environ.get('DATABASE_URL', '').strip()
+DB = Path(os.environ.get('DATABASE_PATH', str(ROOT / 'cyberrakshak.sqlite3')))
+ALLOWED_ORIGIN = os.environ.get('ALLOWED_ORIGIN', '').rstrip('/')
 LOCK = threading.RLock()
 TABLES = ('assets','findings','events','correlations','investigations','remediations','audit','settings')
 
 def connect():
-    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row
-    c.execute('CREATE TABLE IF NOT EXISTS records (kind TEXT NOT NULL, id TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(kind,id))')
+    if DATABASE_URL:
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise RuntimeError('DATABASE_URL is set but psycopg is missing; install requirements.txt') from exc
+        return psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=8, sslmode='require')
+    c=sqlite3.connect(DB, timeout=8); c.row_factory=sqlite3.Row
     return c
+
+def migrate():
+    """Apply versioned, idempotently tracked schema migrations before serving traffic."""
+    migration_dir=ROOT/'migrations'
+    if DATABASE_URL:
+        with connect() as c:
+            c.execute('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)')
+            if not c.execute('SELECT version FROM schema_migrations WHERE version=%s',(1,)).fetchone():
+                for statement in (migration_dir/'001_create_records.postgres.sql').read_text(encoding='utf-8').split(';'):
+                    if statement.strip(): c.execute(statement)
+                c.execute('INSERT INTO schema_migrations(version) VALUES (%s)',(1,))
+        return
+    with connect() as c:
+        c.execute('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
+        if not c.execute('SELECT version FROM schema_migrations WHERE version=?',(1,)).fetchone():
+            c.executescript((migration_dir/'001_create_records.sqlite.sql').read_text(encoding='utf-8'))
+            c.execute('INSERT INTO schema_migrations(version) VALUES (?)',(1,))
 
 def seed():
     with LOCK, connect() as c:
-        if c.execute('SELECT count(*) FROM records').fetchone()[0]: return
+        if c.execute('SELECT count(*) AS count FROM records').fetchone()['count']: return
         initial={
         'assets':[
           {'id':'AST-01','name':'Reception-WS-01','type':'Workstation','owner':'Front desk','software':'Windows 11 · Defender','criticality':'Medium','status':'Monitored','observed':'2026-10-02 09:14'},
@@ -42,21 +67,46 @@ def seed():
         'settings':[{'id':'workspace','name':'Northstar Dental Clinic','organization':'Northstar Dental Clinic','windowHours':24,'verifiedRule':'Direct entity reference plus corroborating evidence','potentialRule':'Plausible match with at least one explicit missing evidence item','simulationMode':True}]
         }
         for k,rows in initial.items():
-            for x in rows:c.execute('INSERT INTO records VALUES (?,?,?)',(k,x['id'],json.dumps(x)))
+            for x in rows:
+                if DATABASE_URL:c.execute('INSERT INTO records(kind,id,body) VALUES (%s,%s,%s)',(k,x['id'],json.dumps(x)))
+                else:c.execute('INSERT INTO records(kind,id,body) VALUES (?,?,?)',(k,x['id'],json.dumps(x)))
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self,*a,**kw): super().__init__(*a,directory=str(ROOT),**kw)
     def log_message(self,*a): pass
     def send_json(self,data,status=200):
-        b=json.dumps(data).encode(); self.send_response(status); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(b))); self.send_header('Access-Control-Allow-Origin','*'); self.end_headers(); self.wfile.write(b)
+        b=json.dumps(data).encode(); self.send_response(status); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(b)))
+        origin=self.headers.get('Origin')
+        if origin and origin == ALLOWED_ORIGIN:
+            self.send_header('Access-Control-Allow-Origin', ALLOWED_ORIGIN); self.send_header('Vary','Origin')
+        self.end_headers(); self.wfile.write(b)
+    def reject_disallowed_origin(self):
+        origin=self.headers.get('Origin')
+        if origin and origin != ALLOWED_ORIGIN:
+            self.send_json({'error':'Origin not allowed'},403)
+            return True
+        return False
+    def do_OPTIONS(self):
+        if self.reject_disallowed_origin(): return
+        self.send_response(204)
+        origin=self.headers.get('Origin')
+        if origin and origin == ALLOWED_ORIGIN:
+            self.send_header('Access-Control-Allow-Origin', ALLOWED_ORIGIN); self.send_header('Vary','Origin')
+            self.send_header('Access-Control-Allow-Methods','GET, POST, DELETE, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers','Content-Type')
+        self.send_header('Content-Length','0'); self.end_headers()
     def rows(self,kind):
-        with LOCK,connect() as c:return [json.loads(r['body']) for r in c.execute('SELECT body FROM records WHERE kind=? ORDER BY rowid',(kind,))]
+        order='record_order' if DATABASE_URL else 'rowid'; marker='%s' if DATABASE_URL else '?'
+        with LOCK,connect() as c:return [json.loads(r['body']) for r in c.execute(f'SELECT body FROM records WHERE kind={marker} ORDER BY {order}',(kind,))]
     def save(self,kind,obj):
-        with LOCK,connect() as c:c.execute('INSERT OR REPLACE INTO records VALUES (?,?,?)',(kind,obj['id'],json.dumps(obj)))
+        with LOCK,connect() as c:
+            if DATABASE_URL:c.execute('INSERT INTO records(kind,id,body) VALUES (%s,%s,%s) ON CONFLICT(kind,id) DO UPDATE SET body=EXCLUDED.body',(kind,obj['id'],json.dumps(obj)))
+            else:c.execute('INSERT OR REPLACE INTO records(kind,id,body) VALUES (?,?,?)',(kind,obj['id'],json.dumps(obj)))
     def audit(self,action,entity,entityId,description,previous=None,new=None,actor='Workspace analyst'):
         import datetime
         a={'id':'AUD-'+str(__import__('time').time_ns()),'time':datetime.datetime.now().astimezone().isoformat(timespec='seconds'),'actor':actor,'action':action,'entityType':entity,'entityId':entityId,'description':description,'previous':previous,'new':new,'origin':'User'}; self.save('audit',a)
     def do_GET(self):
+        if self.reject_disallowed_origin(): return
         if self.path=='/api/live':return self.send_json({'status':'live'})
         if self.path=='/api/ready':
             try:
@@ -71,6 +121,7 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path=='/':self.path='/index.html'
         return super().do_GET()
     def do_POST(self):
+        if self.reject_disallowed_origin(): return
         try:d=json.loads(self.rfile.read(int(self.headers.get('Content-Length',0)))); path=self.path.strip('/').split('/')
         except Exception:return self.send_json({'error':'Invalid JSON body'},400)
         if not isinstance(d,dict):return self.send_json({'error':'JSON body must be an object'},400)
@@ -88,15 +139,17 @@ class Handler(SimpleHTTPRequestHandler):
         if k!='audit':self.audit(action,k.rstrip('s'),d['id'],description,existing,d)
         return self.send_json(d,201 if not existing else 200)
     def do_DELETE(self):
+        if self.reject_disallowed_origin(): return
         p=self.path.strip('/').split('/')
         if len(p)!=3 or p[0]!='api' or p[1] not in TABLES:return self.send_json({'error':'Unknown route'},404)
         kind,rid=p[1],p[2]; old=next((x for x in self.rows(kind) if x['id']==rid),None)
         if not old:return self.send_json({'error':'Record not found'},404)
         if kind=='assets' and any(x.get('assetId')==rid for x in self.rows('findings')+self.rows('events')):return self.send_json({'error':'Asset has linked findings or events and cannot be deleted.'},409)
-        with LOCK,connect() as c:c.execute('DELETE FROM records WHERE kind=? AND id=?',(kind,rid))
+        marker='%s' if DATABASE_URL else '?'
+        with LOCK,connect() as c:c.execute(f'DELETE FROM records WHERE kind={marker} AND id={marker}',(kind,rid))
         self.audit('deleted',kind.rstrip('s'),rid,f"{kind.rstrip('s').title()} {rid} deleted",old,None); return self.send_json({'ok':True})
 
 if __name__=='__main__':
-    seed(); port=int(os.environ.get('PORT','8080')); host=os.environ.get('HOST','0.0.0.0')
+    migrate(); seed(); port=int(os.environ.get('PORT','8080')); host=os.environ.get('HOST','0.0.0.0')
     print(f'CyberRakshak AI listening on {host}:{port} (simulation only)',flush=True)
     ThreadingHTTPServer((host,port),Handler).serve_forever()
