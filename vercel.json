@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    { "source": "/demo-login", "destination": "/index.html" },
+    { "source": "/demo-login/", "destination": "/index.html" },
+    { "source": "/access-request", "destination": "/index.html" },
+    { "source": "/access-request/", "destination": "/index.html" }
+  ]
+}
